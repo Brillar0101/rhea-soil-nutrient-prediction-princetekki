@@ -3,12 +3,8 @@
 =============================================================================
 RHEA SOIL NUTRIENT PREDICTION - H200 GPU PIPELINE
 =============================================================================
-Self-contained script. Copy this + data/ folder to GPU cluster and run:
-    pip install lightgbm xgboost catboost scikit-learn pandas numpy scipy
-    python run_gpu.py
-
-GPU-optimized: CatBoost GPU, XGBoost GPU, aggressive LightGBM, 10-fold CV,
-multi-seed ensembling, stacking meta-learner.
+pip install lightgbm xgboost catboost scikit-learn pandas numpy scipy tqdm
+python run_gpu.py
 """
 import os, warnings, numpy as np, pandas as pd, sys, gc
 from datetime import datetime
@@ -23,13 +19,9 @@ from scipy.optimize import minimize
 import lightgbm as lgb
 import xgboost as xgb
 import catboost as cb
+from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
-print = lambda *a, **k: __builtins__['print'] if callable(__builtins__) else None  # noqa
-import builtins
-def print(*args, **kwargs):
-    kwargs['flush'] = True
-    builtins.print(*args, **kwargs)
 
 SEED = 42
 N_FOLDS = 10
@@ -39,25 +31,36 @@ os.makedirs(SDIR, exist_ok=True)
 TARGETS = ["Al","B","Ca","Cu","Fe","K","Mg","Mn","N","Na","P","S","Zn"]
 EXTRA = ["C_organic","C_total","ph"]
 
+
 # ============================================================================
 # FEATURE ENGINEERING
 # ============================================================================
 def build_features():
-    print(f"[{datetime.now()}] Loading data...")
-    train = pd.read_csv(os.path.join(DATA, "Train.csv"))
-    test = pd.read_csv(os.path.join(DATA, "TestSet.csv"))
-    dates = pd.read_csv(os.path.join(DATA, "Sample_Collection_Dates.csv"))
-    tk = pd.read_csv(os.path.join(DATA, "TargetPred_To_Keep.csv"))
-    ss = pd.read_csv(os.path.join(DATA, "SampleSubmission.csv"))
+    print(f"\n{'='*70}")
+    print(f"  STEP 1: FEATURE ENGINEERING")
+    print(f"{'='*70}\n")
+
+    # --- Load ---
+    load_files = ["Train.csv", "TestSet.csv", "Sample_Collection_Dates.csv",
+                   "TargetPred_To_Keep.csv", "SampleSubmission.csv"]
+    loaded = {}
+    for f in tqdm(load_files, desc="Loading data files"):
+        loaded[f] = pd.read_csv(os.path.join(DATA, f))
+
+    train = loaded["Train.csv"]
+    test = loaded["TestSet.csv"]
+    dates = loaded["Sample_Collection_Dates.csv"]
+    tk = loaded["TargetPred_To_Keep.csv"]
+    ss = loaded["SampleSubmission.csv"]
     print(f"  Train={train.shape}, Test={test.shape}")
 
-    # Merge dates
+    # --- Merge dates ---
     td = dates[dates["set"] == "Test"][["ID", "start_date"]]
     test = test.merge(td, on="ID", how="left")
     test["dg"] = test["start_date"].apply(lambda x: 1 if "2022" in str(x) else 0)
     train["dg"] = 0
 
-    # Depth
+    # --- Depth ---
     def dmid(d):
         p = str(d).replace(" ", "").replace("cm", "").split("-")
         try: return (float(p[0]) + float(p[1])) / 2
@@ -67,7 +70,7 @@ def build_features():
         d["dm"] = d["Depth_cm"].apply(dmid)
         d["ts"] = (d["dm"] <= 20).astype(int)
 
-    # Combine
+    # --- Combine ---
     kc = ["ID", "Latitude", "Longitude", "dm", "ts", "dg"]
     tc = kc + TARGETS + [c for c in EXTRA if c in train.columns]
     trs = train[[c for c in tc if c in train.columns]].copy()
@@ -78,100 +81,107 @@ def build_features():
     lat, lon, dep = df["Latitude"].values, df["Longitude"].values, df["dm"].values
 
     # === GEO FEATURES ===
-    print(f"[{datetime.now()}] Geo features...")
-    df["alat"] = np.abs(lat)
-    df["llp"] = lat * lon
-    df["llr"] = lat / (lon + 1e-8)
-    df["gr"] = np.sqrt(lat**2 + lon**2)
-    df["ga"] = np.arctan2(lat, lon)
-    df["lsq"] = lat**2
-    df["lnsq"] = lon**2
-    df["lcb"] = lat**3
-    df["lncb"] = lon**3
-    df["l_ln2"] = lat * lon**2
-    df["ln_l2"] = lon * lat**2
+    geo_steps = [
+        ("abs_lat", lambda: np.abs(lat)),
+        ("lat*lon", lambda: lat * lon),
+        ("lat/lon", lambda: lat / (lon + 1e-8)),
+        ("geo_radius", lambda: np.sqrt(lat**2 + lon**2)),
+        ("geo_angle", lambda: np.arctan2(lat, lon)),
+        ("lat^2", lambda: lat**2),
+        ("lon^2", lambda: lon**2),
+        ("lat^3", lambda: lat**3),
+        ("lon^3", lambda: lon**3),
+        ("lat*lon^2", lambda: lat * lon**2),
+        ("lon*lat^2", lambda: lon * lat**2),
+    ]
+    col_names = ["alat","llp","llr","gr","ga","lsq","lnsq","lcb","lncb","l_ln2","ln_l2"]
+    for (desc, fn), cn in tqdm(list(zip(geo_steps, col_names)), desc="Geo features"):
+        df[cn] = fn()
 
-    for r in [0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]:
+    # Grid bins
+    resolutions = [0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]
+    for r in tqdm(resolutions, desc="Grid bins"):
         df[f"lb{r}"] = np.floor(lat / r) * r
         df[f"nb{r}"] = np.floor(lon / r) * r
 
     df["is_s"] = (lat < 0).astype(int)
     df["is_eq"] = (np.abs(lat) < 5).astype(int)
 
+    # Haversine distances to landmarks
     def hav(a1, o1, a2, o2):
         a1, o1, a2, o2 = map(np.radians, [a1, o1, a2, o2])
         a = np.sin((a2-a1)/2)**2 + np.cos(a1)*np.cos(a2)*np.sin((o2-o1)/2)**2
         return 6371 * 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
-    for nm, (rl, rn) in {"nai": (-1.29, 36.82), "dar": (-6.79, 39.28),
-                          "vic": (-1, 33), "kil": (-3.07, 37.35),
-                          "kam": (0.35, 32.58), "add": (9.02, 38.75),
-                          "cap": (-33.93, 18.42), "kin": (-4.32, 15.31)}.items():
+    landmarks = {"nai": (-1.29, 36.82), "dar": (-6.79, 39.28),
+                  "vic": (-1, 33), "kil": (-3.07, 37.35),
+                  "kam": (0.35, 32.58), "add": (9.02, 38.75),
+                  "cap": (-33.93, 18.42), "kin": (-4.32, 15.31)}
+    for nm, (rl, rn) in tqdm(landmarks.items(), desc="Landmark distances"):
         df[f"h_{nm}"] = hav(lat, lon, rl, rn)
 
-    # === DEPTH ===
-    print(f"[{datetime.now()}] Depth features...")
-    df["ld"] = np.log1p(dep)
-    df["sd"] = np.sqrt(dep)
-    df["dsq"] = dep**2
-    df["dxl"] = dep * lat
-    df["dxn"] = dep * lon
-    df["dxal"] = dep * np.abs(lat)
-    df["dxgr"] = dep * df["gr"]
-    df["ldxl"] = df["ld"] * lat
-    df["ldxn"] = df["ld"] * lon
+    # === DEPTH FEATURES ===
+    depth_feats = {"ld": np.log1p(dep), "sd": np.sqrt(dep), "dsq": dep**2,
+                    "dxl": dep*lat, "dxn": dep*lon, "dxal": dep*np.abs(lat),
+                    "dxgr": dep*df["gr"].values, "ldxl": np.log1p(dep)*lat,
+                    "ldxn": np.log1p(dep)*lon}
+    for cn, vals in tqdm(depth_feats.items(), desc="Depth features"):
+        df[cn] = vals
 
     # === CLIMATE PROXIES ===
-    print(f"[{datetime.now()}] Climate proxies...")
     al = np.abs(lat)
-    df["tp"] = 30 - 0.5 * al
-    df["tr"] = 5.0 + 0.3 * al
-    df["pp"] = 2000 * np.exp(-0.05 * (al - 5)**2)
+    climate_feats = {
+        "tp": 30 - 0.5 * al,
+        "tr": 5.0 + 0.3 * al,
+        "pp": 2000 * np.exp(-0.05 * (al - 5)**2),
+    }
+    for cn, vals in tqdm(climate_feats.items(), desc="Climate proxies"):
+        df[cn] = vals
     df["ap"] = df["tp"] / (df["pp"] + 1)
     df["pet"] = 16 * (10 * np.clip(df["tp"], 0, None) / 50)**1.5
     df["mp"] = df["pp"] - df["pet"]
 
-    df["z_tw"] = ((al < 10) & (lon > 25)).astype(int)
-    df["z_sh"] = ((lat > 10) & (lat < 20)).astype(int)
-    df["z_ea"] = ((lon > 30) & (lon < 42) & (lat > -12) & (lat < 5)).astype(int)
-    df["z_sa"] = (lat < -15).astype(int)
-    df["z_kc"] = ((lat > -2) & (lat < 1) & (lon > 36) & (lon < 38)).astype(int)
-    df["z_kr"] = ((lat > -2) & (lat < 1) & (lon > 35) & (lon < 36.5)).astype(int)
-    df["z_kco"] = ((lat > -5) & (lat < -2) & (lon > 38) & (lon < 41)).astype(int)
+    zones = {"z_tw": (al < 10) & (lon > 25),
+             "z_sh": (lat > 10) & (lat < 20),
+             "z_ea": (lon > 30) & (lon < 42) & (lat > -12) & (lat < 5),
+             "z_sa": lat < -15,
+             "z_kc": (lat > -2) & (lat < 1) & (lon > 36) & (lon < 38),
+             "z_kr": (lat > -2) & (lat < 1) & (lon > 35) & (lon < 36.5),
+             "z_kco": (lat > -5) & (lat < -2) & (lon > 38) & (lon < 41)}
+    for cn, mask in tqdm(zones.items(), desc="Climate zones"):
+        df[cn] = mask.astype(int)
 
     # === CLUSTERS ===
-    print(f"[{datetime.now()}] Spatial clusters...")
     coords = np.column_stack([lat, lon])
-    for nc in [3, 5, 10, 20, 50, 100, 200, 500]:
+    cluster_sizes = [3, 5, 10, 20, 50, 100, 200, 500]
+    for nc in tqdm(cluster_sizes, desc="2D Clusters"):
         km = MiniBatchKMeans(n_clusters=nc, random_state=SEED, n_init=3, batch_size=5000)
         lb = km.fit_predict(coords)
         df[f"c{nc}"] = lb
         df[f"dc{nc}"] = np.sqrt(((coords - km.cluster_centers_[lb])**2).sum(1))
 
-    # 3D clusters
     c3d = np.column_stack([lat, lon, dep / 1000])
-    for nc in [10, 30, 50, 100]:
+    for nc in tqdm([10, 30, 50, 100], desc="3D Clusters"):
         km = MiniBatchKMeans(n_clusters=nc, random_state=SEED, n_init=3, batch_size=5000)
         df[f"c3d{nc}"] = km.fit_predict(c3d)
 
     # === DENSITY ===
-    print(f"[{datetime.now()}] Density features...")
-    for r in [0.05, 0.1, 0.5, 1.0]:
+    for r in tqdm([0.05, 0.1, 0.5, 1.0], desc="Density features"):
         cell = df[f"lb{r}"].astype(str) + "_" + df[f"nb{r}"].astype(str)
         df[f"dns{r}"] = cell.map(cell.value_counts()).values
 
-    for nc in [10, 50, 100, 200]:
+    for nc in tqdm([10, 50, 100, 200], desc="Cluster frequency"):
         df[f"cf{nc}"] = df[f"c{nc}"].map(df[f"c{nc}"].value_counts()).values
 
-    # === NEAREST NEIGHBORS (THE GAME WINNER) ===
-    print(f"[{datetime.now()}] Nearest neighbor features...")
+    # === NEAREST NEIGHBORS ===
+    print(f"\n  Building BallTree on {(df['_t']==1).sum()} training points...")
     tmask = df["_t"].values == 1
     tree = BallTree(np.radians(coords[tmask]), metric="haversine")
     ti = np.where(tmask)[0]
     ac = np.radians(coords)
 
-    for K in [1, 3, 5, 10, 20, 50, 100]:
-        print(f"  K={K}...", end=" ")
+    K_values = [1, 3, 5, 10, 20, 50, 100]
+    for K in tqdm(K_values, desc="NN queries (K-values)"):
         d_, idx_ = tree.query(ac, k=K)
         dk = d_ * 6371
         w = 1.0 / (dk + 0.001)
@@ -207,7 +217,6 @@ def build_features():
             if K >= 5:
                 df[f"n{K}{ex}s"] = np.nanstd(ev, 1)
 
-        # Cross-nutrient ratios
         if K <= 20:
             for t1, t2 in [("Ca","Mg"),("Ca","K"),("Al","Fe"),("Cu","Mn"),
                             ("Al","N"),("Fe","Mn"),("K","Mg"),("Cu","Mg")]:
@@ -216,14 +225,11 @@ def build_features():
                     v2 = np.nanmean(df[t2].values[ti[idx_]], 1)
                     df[f"n{K}{t1}{t2}r"] = v1 / (v2 + 1e-8)
 
-        # Depth match ratio
         nd = df["dm"].values[ti[idx_]]
         df[f"n{K}dm"] = (nd == dep.reshape(-1, 1)).mean(1)
-        print("done")
 
     # Depth-aware neighbors
-    print(f"[{datetime.now()}] Depth-aware neighbors...")
-    for dv in [0, 1]:
+    for dv in tqdm([0, 1], desc="Depth-aware NN"):
         dm = tmask & (df["ts"].values == dv)
         if dm.sum() < 10: continue
         trd = BallTree(np.radians(coords[dm]), metric="haversine")
@@ -250,7 +256,7 @@ def build_features():
     fc = [c for c in trf.columns if c not in exc
           and trf[c].dtype in ["float64","float32","int64","int32","uint8"]]
 
-    print(f"[{datetime.now()}] Features: {len(fc)}")
+    print(f"\n  Total features: {len(fc)}")
     print(f"  Train={trf.shape}, Test={tef.shape}")
 
     return trf, tef, fc, tk, ss
@@ -260,15 +266,15 @@ def build_features():
 # GPU MODEL TRAINING
 # ============================================================================
 def train_all(trf, tef, fc, tk, ss):
-    print(f"\n[{datetime.now()}] ========== TRAINING ==========")
+    print(f"\n{'='*70}")
+    print(f"  STEP 2: MODEL TRAINING")
+    print(f"{'='*70}\n")
 
     X = np.nan_to_num(trf[fc].values.astype(np.float32))
     Xt = np.nan_to_num(tef[fc].values.astype(np.float32))
     print(f"  X={X.shape}, Xt={Xt.shape}")
 
-    # --- MODEL CONFIGS (GPU-OPTIMIZED) ---
     cfgs = {
-        # LightGBM variants (CPU - LGB GPU requires special build)
         "lgb1": ("lgb", {
             "objective": "regression", "metric": "rmse", "boosting_type": "gbdt",
             "n_estimators": 10000, "learning_rate": 0.01,
@@ -309,7 +315,6 @@ def train_all(trf, tef, fc, tk, ss):
             "reg_alpha": 0.1, "reg_lambda": 1.0, "drop_rate": 0.1,
             "random_state": SEED + 4, "verbose": -1, "n_jobs": -1,
         }),
-        # XGBoost GPU
         "xgb1": ("xgb", {
             "objective": "reg:squarederror", "eval_metric": "rmse",
             "n_estimators": 10000, "learning_rate": 0.01,
@@ -328,7 +333,6 @@ def train_all(trf, tef, fc, tk, ss):
             "tree_method": "hist", "device": "cuda",
             "random_state": SEED + 10, "verbosity": 0, "early_stopping_rounds": 300,
         }),
-        # CatBoost (try GPU, fallback to CPU automatically)
         "cb1": ("cb", {
             "iterations": 8000, "learning_rate": 0.02, "depth": 8,
             "l2_leaf_reg": 3, "random_seed": SEED, "verbose": 0,
@@ -347,7 +351,6 @@ def train_all(trf, tef, fc, tk, ss):
             "loss_function": "RMSE", "eval_metric": "RMSE",
             "min_data_in_leaf": 3,
         }),
-        # ExtraTrees (CPU, fast enough)
         "et": ("et", {
             "n_estimators": 2000, "max_depth": None,
             "min_samples_split": 3, "min_samples_leaf": 1,
@@ -359,11 +362,10 @@ def train_all(trf, tef, fc, tk, ss):
     cvs = {}
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
-    for tidx, tgt in enumerate(TARGETS):
+    target_pbar = tqdm(TARGETS, desc="Targets", position=0)
+    for tidx, tgt in enumerate(target_pbar):
         t0 = datetime.now()
-        print(f"\n{'='*60}")
-        print(f"  TARGET [{tidx+1}/13]: {tgt}")
-        print(f"{'='*60}")
+        target_pbar.set_description(f"Target {tgt}")
 
         if tgt not in trf.columns:
             preds[tgt] = np.zeros(len(Xt)); continue
@@ -371,21 +373,26 @@ def train_all(trf, tef, fc, tk, ss):
         y = trf[tgt].values
         v = ~np.isnan(y)
         nv = v.sum()
-        print(f"  Valid: {nv}/{len(y)} ({nv/len(y)*100:.1f}%)")
 
         if nv < 50:
             c = f"n5{tgt}i"
             preds[tgt] = np.clip(Xt[:, fc.index(c)], 0, None) if c in fc else np.zeros(len(Xt))
-            print(f"  -> IDW fallback"); continue
+            tqdm.write(f"  {tgt}: IDW fallback (n={nv})")
+            continue
 
         od, td_, sd = {}, {}, {}
 
-        for mn, (mt, mp) in cfgs.items():
+        model_pbar = tqdm(cfgs.items(), desc=f"  {tgt} models", position=1, leave=False)
+        for mn, (mt, mp) in model_pbar:
+            model_pbar.set_description(f"  {tgt} > {mn}")
             oof = np.zeros(len(X))
             tp = np.zeros(len(Xt))
             fs = []
 
-            for fi, (tri, vai) in enumerate(kf.split(X)):
+            fold_pbar = tqdm(enumerate(kf.split(X)), total=N_FOLDS,
+                              desc=f"    {mn} folds", position=2, leave=False)
+            for fi, (tri, vai) in fold_pbar:
+                fold_pbar.set_description(f"    {mn} fold {fi+1}/{N_FOLDS}")
                 ytr, yva = y[tri], y[vai]
                 tok, vok = ~np.isnan(ytr), ~np.isnan(yva)
                 if tok.sum() < 10 or vok.sum() < 3: continue
@@ -412,68 +419,76 @@ def train_all(trf, tef, fc, tk, ss):
 
                     vp = np.clip(m.predict(Xva_c), 0, None)
                     oof[vai[vok]] = vp
-                    fs.append(np.sqrt(mean_squared_error(yva_c, vp)))
+                    fold_rmse = np.sqrt(mean_squared_error(yva_c, vp))
+                    fs.append(fold_rmse)
                     tp += np.clip(m.predict(Xt), 0, None) / N_FOLDS
+                    fold_pbar.set_postfix(rmse=f"{fold_rmse:.1f}")
 
                 except Exception as e:
-                    print(f"    {mn} fold {fi} ERROR: {e}")
+                    tqdm.write(f"    ERROR {mn} fold {fi}: {e}")
+
+            fold_pbar.close()
 
             if fs:
                 avg = np.mean(fs)
-                print(f"    {mn:10s}: RMSE={avg:.4f} (std={np.std(fs):.4f})")
+                tqdm.write(f"    {mn:10s}: RMSE={avg:.4f} (std={np.std(fs):.4f})")
                 od[mn] = oof; td_[mn] = tp; sd[mn] = avg
+
+        model_pbar.close()
 
         # === MULTI-SEED for top 2 models ===
         if len(sd) >= 2:
             top2 = sorted(sd, key=sd.get)[:2]
-            for base_mn in top2:
+            seed_combos = [(base_mn, si) for base_mn in top2
+                           for si in range(3)
+                           if cfgs[base_mn][0] in ("lgb", "xgb", "cb")]
+
+            for base_mn, si in tqdm(seed_combos, desc=f"  {tgt} multi-seed", position=1, leave=False):
                 base_mt, base_mp = cfgs[base_mn]
-                if base_mt not in ("lgb", "xgb", "cb"): continue
-                for si in range(3):
-                    smn = f"{base_mn}_s{si}"
-                    smp = base_mp.copy()
-                    if "random_state" in smp: smp["random_state"] = SEED + 100 + si * 50
-                    if "random_seed" in smp: smp["random_seed"] = SEED + 100 + si * 50
+                smn = f"{base_mn}_s{si}"
+                smp = base_mp.copy()
+                if "random_state" in smp: smp["random_state"] = SEED + 100 + si * 50
+                if "random_seed" in smp: smp["random_seed"] = SEED + 100 + si * 50
 
-                    oof_s = np.zeros(len(X)); tp_s = np.zeros(len(Xt)); fs_s = []
-                    kf_s = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED + 100 + si * 50)
+                oof_s = np.zeros(len(X)); tp_s = np.zeros(len(Xt)); fs_s = []
+                kf_s = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED + 100 + si * 50)
 
-                    for fi, (tri, vai) in enumerate(kf_s.split(X)):
-                        ytr, yva = y[tri], y[vai]
-                        tok, vok = ~np.isnan(ytr), ~np.isnan(yva)
-                        if tok.sum() < 10 or vok.sum() < 3: continue
-                        try:
-                            if base_mt == "lgb":
-                                m = lgb.LGBMRegressor(**smp)
-                                m.fit(X[tri][tok], ytr[tok],
-                                      eval_set=[(X[vai][vok], yva[vok])],
-                                      callbacks=[lgb.early_stopping(300, verbose=False),
-                                                 lgb.log_evaluation(0)])
-                            elif base_mt == "xgb":
-                                m = xgb.XGBRegressor(**smp)
-                                m.fit(X[tri][tok], ytr[tok],
-                                      eval_set=[(X[vai][vok], yva[vok])], verbose=False)
-                            elif base_mt == "cb":
-                                m = cb.CatBoostRegressor(**smp)
-                                m.fit(X[tri][tok], ytr[tok],
-                                      eval_set=(X[vai][vok], yva[vok]),
-                                      early_stopping_rounds=300, verbose=0)
+                for fi, (tri, vai) in enumerate(kf_s.split(X)):
+                    ytr, yva = y[tri], y[vai]
+                    tok, vok = ~np.isnan(ytr), ~np.isnan(yva)
+                    if tok.sum() < 10 or vok.sum() < 3: continue
+                    try:
+                        if base_mt == "lgb":
+                            m = lgb.LGBMRegressor(**smp)
+                            m.fit(X[tri][tok], ytr[tok],
+                                  eval_set=[(X[vai][vok], yva[vok])],
+                                  callbacks=[lgb.early_stopping(300, verbose=False),
+                                             lgb.log_evaluation(0)])
+                        elif base_mt == "xgb":
+                            m = xgb.XGBRegressor(**smp)
+                            m.fit(X[tri][tok], ytr[tok],
+                                  eval_set=[(X[vai][vok], yva[vok])], verbose=False)
+                        elif base_mt == "cb":
+                            m = cb.CatBoostRegressor(**smp)
+                            m.fit(X[tri][tok], ytr[tok],
+                                  eval_set=(X[vai][vok], yva[vok]),
+                                  early_stopping_rounds=300, verbose=0)
 
-                            vp = np.clip(m.predict(X[vai][vok]), 0, None)
-                            oof_s[vai[vok]] = vp
-                            fs_s.append(np.sqrt(mean_squared_error(yva[vok], vp)))
-                            tp_s += np.clip(m.predict(Xt), 0, None) / N_FOLDS
-                        except Exception:
-                            pass
+                        vp = np.clip(m.predict(X[vai][vok]), 0, None)
+                        oof_s[vai[vok]] = vp
+                        fs_s.append(np.sqrt(mean_squared_error(yva[vok], vp)))
+                        tp_s += np.clip(m.predict(Xt), 0, None) / N_FOLDS
+                    except Exception:
+                        pass
 
-                    if fs_s:
-                        avg_s = np.mean(fs_s)
-                        print(f"    {smn:10s}: RMSE={avg_s:.4f}")
-                        od[smn] = oof_s; td_[smn] = tp_s; sd[smn] = avg_s
+                if fs_s:
+                    avg_s = np.mean(fs_s)
+                    tqdm.write(f"    {smn:10s}: RMSE={avg_s:.4f}")
+                    od[smn] = oof_s; td_[smn] = tp_s; sd[smn] = avg_s
 
         # === ENSEMBLE ===
         if len(od) > 1:
-            print(f"\n  Ensembling {len(od)} models...")
+            tqdm.write(f"\n  Ensembling {len(od)} models for {tgt}...")
             mns = sorted(od.keys())
             om = np.column_stack([od[m] for m in mns])
             tm = np.column_stack([td_[m] for m in mns])
@@ -485,7 +500,8 @@ def train_all(trf, tef, fc, tk, ss):
             bw = np.ones(len(mns)) / len(mns)
             br = fn(bw); bp = None
 
-            for meth in ["Nelder-Mead", "Powell", "COBYLA"]:
+            for meth in tqdm(["Nelder-Mead", "Powell", "COBYLA"],
+                              desc=f"  {tgt} weight opt", position=1, leave=False):
                 try:
                     res = minimize(fn, bw, method=meth, options={"maxiter": 50000})
                     if res.fun < br:
@@ -509,16 +525,16 @@ def train_all(trf, tef, fc, tk, ss):
                 mr = np.sqrt(mean_squared_error(y[v], mo))
                 if mr < br:
                     br = mr; bp = np.clip(mt_, 0, None)
-                    print(f"  -> Ridge stacking: {mr:.4f}")
+                    tqdm.write(f"  -> Ridge stacking wins: {mr:.4f}")
             except: pass
 
             if bp is None:
                 bp = np.clip(tm.mean(1), 0, None)
 
             preds[tgt] = bp; cvs[tgt] = br
-            print(f"  ENSEMBLE: {br:.4f}")
-            print(f"  Weights: {dict(zip(mns, [f'{w:.3f}' for w in bw]))}")
-            print(f"  Best single: {min(sd, key=sd.get)} ({min(sd.values()):.4f})")
+            best_single = min(sd, key=sd.get)
+            tqdm.write(f"  ENSEMBLE: {br:.4f} | Best single: {best_single} ({sd[best_single]:.4f})")
+            tqdm.write(f"  Weights: {dict(zip(mns, [f'{w:.3f}' for w in bw]))}")
 
         elif len(td_) == 1:
             mn_ = list(td_.keys())[0]
@@ -527,9 +543,10 @@ def train_all(trf, tef, fc, tk, ss):
             preds[tgt] = np.zeros(len(Xt)); cvs[tgt] = 999
 
         elapsed = (datetime.now() - t0).total_seconds()
-        print(f"  Time: {elapsed:.0f}s")
+        tqdm.write(f"  {tgt} done in {elapsed:.0f}s\n")
         gc.collect()
 
+    target_pbar.close()
     return preds, cvs, tef, tk, ss
 
 
@@ -537,23 +554,25 @@ def train_all(trf, tef, fc, tk, ss):
 # SUBMISSION
 # ============================================================================
 def make_submission(preds, tef, tk, ss):
-    print(f"\n[{datetime.now()}] Creating submission...")
+    print(f"\n{'='*70}")
+    print(f"  STEP 3: SUBMISSION")
+    print(f"{'='*70}\n")
+
     sub = ss[["ID"]].copy()
     ids = tef["ID"].values
 
-    for t in TARGETS:
+    for t in tqdm(TARGETS, desc="Mapping predictions"):
         c = f"Target_{t}"
         sub[c] = sub["ID"].map(dict(zip(ids, preds.get(t, np.zeros(len(ids)))))).fillna(0).clip(lower=0)
 
-    # Apply mask
-    for t in TARGETS:
+    for t in tqdm(TARGETS, desc="Applying mask"):
         c = f"Target_{t}"
         if t in tk.columns and c in sub.columns:
             mask = sub["ID"].map(tk.set_index("ID")[t]).fillna(0)
             b = (sub[c] > 0).sum()
             sub[c] *= mask
             a = (sub[c] > 0).sum()
-            print(f"  {t}: {b} -> {a} non-zero")
+            tqdm.write(f"  {t}: {b} -> {a} non-zero")
 
     assert list(sub.columns) == list(ss.columns) and len(sub) == len(ss)
 
@@ -561,7 +580,7 @@ def make_submission(preds, tef, tk, ss):
     p = os.path.join(SDIR, f"sub_gpu_{ts}.csv")
     sub.to_csv(p, index=False)
     sub.to_csv(os.path.join(SDIR, "submission_latest.csv"), index=False)
-    print(f"  Saved: {p} ({sub.shape})")
+    print(f"\n  Saved: {p} ({sub.shape})")
     return sub
 
 
@@ -570,18 +589,18 @@ def make_submission(preds, tef, tk, ss):
 # ============================================================================
 if __name__ == "__main__":
     t0 = datetime.now()
-    print(f"{'='*80}")
+    print(f"\n{'='*70}")
     print(f"  RHEA SOIL NUTRIENT PREDICTION - H200 GPU PIPELINE")
     print(f"  Started: {t0}")
-    print(f"{'='*80}")
+    print(f"{'='*70}")
 
     trf, tef, fc, tk, ss = build_features()
     preds, cvs, tef, tk, ss = train_all(trf, tef, fc, tk, ss)
     sub = make_submission(preds, tef, tk, ss)
 
-    print(f"\n{'='*80}")
+    print(f"\n{'='*70}")
     print(f"  CV SCORES")
-    print(f"{'='*80}")
+    print(f"{'='*70}")
     all_s = []
     for t in TARGETS:
         if t in cvs:
