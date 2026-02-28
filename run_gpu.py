@@ -4,10 +4,11 @@
 RHEA SOIL NUTRIENT PREDICTION - H200 GPU PIPELINE
 =============================================================================
 pip install lightgbm xgboost catboost scikit-learn pandas numpy scipy tqdm
-python run_gpu.py
+python -u run_gpu.py 2>&1 | tee run_output.log
 """
-import os, warnings, numpy as np, pandas as pd, sys, gc
+import os, warnings, numpy as np, pandas as pd, sys, gc, subprocess
 from datetime import datetime
+from functools import partial
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_squared_error
 from sklearn.neighbors import BallTree
@@ -19,9 +20,19 @@ from scipy.optimize import minimize
 import lightgbm as lgb
 import xgboost as xgb
 import catboost as cb
-from tqdm import tqdm
+from tqdm import tqdm as _tqdm_orig
 
 warnings.filterwarnings("ignore")
+
+# Force tqdm to show even when piped (| tee)
+tqdm = partial(_tqdm_orig, dynamic_ncols=True, file=sys.stderr, mininterval=0.5)
+tqdm_write = partial(_tqdm_orig.write, file=sys.stderr)
+
+# Also make print flush immediately
+_print = print
+def print(*args, **kwargs):
+    kwargs.setdefault("flush", True)
+    _print(*args, **kwargs)
 
 SEED = 42
 N_FOLDS = 10
@@ -30,6 +41,66 @@ SDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "submissions")
 os.makedirs(SDIR, exist_ok=True)
 TARGETS = ["Al","B","Ca","Cu","Fe","K","Mg","Mn","N","Na","P","S","Zn"]
 EXTRA = ["C_organic","C_total","ph"]
+
+# ============================================================================
+# GPU DETECTION
+# ============================================================================
+def detect_gpu():
+    """Detect available GPUs and return config."""
+    print("\n" + "="*70)
+    print("  GPU DETECTION")
+    print("="*70)
+
+    # Check nvidia-smi
+    try:
+        result = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            # Extract GPU name
+            for line in result.stdout.split("\n"):
+                if "NVIDIA" in line and ("H200" in line or "H100" in line or "A100" in line
+                                          or "V100" in line or "RTX" in line or "Tesla" in line):
+                    gpu_name = line.strip()
+                    print(f"  GPU found: {gpu_name}")
+                    break
+            else:
+                print(f"  GPU found via nvidia-smi")
+            # Show memory
+            for line in result.stdout.split("\n"):
+                if "MiB" in line and "|" in line:
+                    print(f"  {line.strip()}")
+                    break
+        else:
+            print("  nvidia-smi failed - no NVIDIA GPU?")
+    except Exception as e:
+        print(f"  nvidia-smi not found: {e}")
+
+    # Test XGBoost GPU
+    xgb_gpu = False
+    try:
+        m = xgb.XGBRegressor(tree_method="hist", device="cuda", n_estimators=5, verbosity=0)
+        m.fit(np.random.rand(100, 5), np.random.rand(100))
+        m.predict(np.random.rand(10, 5))
+        xgb_gpu = True
+        print("  XGBoost GPU:  AVAILABLE")
+    except Exception as e:
+        print(f"  XGBoost GPU:  NOT AVAILABLE ({e})")
+
+    # Test CatBoost GPU
+    cb_gpu = False
+    try:
+        m = cb.CatBoostRegressor(iterations=5, task_type="GPU", devices="0", verbose=0)
+        m.fit(np.random.rand(100, 5), np.random.rand(100))
+        m.predict(np.random.rand(10, 5))
+        cb_gpu = True
+        print("  CatBoost GPU: AVAILABLE")
+    except Exception as e:
+        print(f"  CatBoost GPU: NOT AVAILABLE ({e})")
+
+    print(f"  LightGBM:     CPU (GPU requires special build)")
+    print(f"  ExtraTrees:   CPU")
+    print()
+
+    return xgb_gpu, cb_gpu
 
 
 # ============================================================================
@@ -265,9 +336,11 @@ def build_features():
 # ============================================================================
 # GPU MODEL TRAINING
 # ============================================================================
-def train_all(trf, tef, fc, tk, ss):
+def train_all(trf, tef, fc, tk, ss, xgb_gpu=False, cb_gpu=False):
     print(f"\n{'='*70}")
     print(f"  STEP 2: MODEL TRAINING")
+    print(f"  XGBoost GPU: {'YES' if xgb_gpu else 'NO (CPU)'}")
+    print(f"  CatBoost GPU: {'YES' if cb_gpu else 'NO (CPU)'}")
     print(f"{'='*70}\n")
 
     X = np.nan_to_num(trf[fc].values.astype(np.float32))
@@ -321,7 +394,7 @@ def train_all(trf, tef, fc, tk, ss):
             "max_depth": 10, "min_child_weight": 3,
             "subsample": 0.7, "colsample_bytree": 0.4, "colsample_bylevel": 0.7,
             "reg_alpha": 0.05, "reg_lambda": 0.5,
-            "tree_method": "hist", "device": "cuda",
+            **( {"tree_method": "hist", "device": "cuda"} if xgb_gpu else {"tree_method": "hist"} ),
             "random_state": SEED, "verbosity": 0, "early_stopping_rounds": 300,
         }),
         "xgb2": ("xgb", {
@@ -330,7 +403,7 @@ def train_all(trf, tef, fc, tk, ss):
             "max_depth": 8, "min_child_weight": 5,
             "subsample": 0.8, "colsample_bytree": 0.5,
             "reg_alpha": 0.5, "reg_lambda": 2.0, "gamma": 0.1,
-            "tree_method": "hist", "device": "cuda",
+            **( {"tree_method": "hist", "device": "cuda"} if xgb_gpu else {"tree_method": "hist"} ),
             "random_state": SEED + 10, "verbosity": 0, "early_stopping_rounds": 300,
         }),
         "cb1": ("cb", {
@@ -338,18 +411,21 @@ def train_all(trf, tef, fc, tk, ss):
             "l2_leaf_reg": 3, "random_seed": SEED, "verbose": 0,
             "loss_function": "RMSE", "eval_metric": "RMSE",
             "min_data_in_leaf": 5,
+            **( {"task_type": "GPU", "devices": "0"} if cb_gpu else {} ),
         }),
         "cb2": ("cb", {
             "iterations": 6000, "learning_rate": 0.03, "depth": 6,
             "l2_leaf_reg": 5, "random_seed": SEED + 5, "verbose": 0,
             "loss_function": "RMSE", "eval_metric": "RMSE",
             "min_data_in_leaf": 10,
+            **( {"task_type": "GPU", "devices": "0"} if cb_gpu else {} ),
         }),
         "cb3": ("cb", {
             "iterations": 5000, "learning_rate": 0.04, "depth": 10,
             "l2_leaf_reg": 1, "random_seed": SEED + 7, "verbose": 0,
             "loss_function": "RMSE", "eval_metric": "RMSE",
             "min_data_in_leaf": 3,
+            **( {"task_type": "GPU", "devices": "0"} if cb_gpu else {} ),
         }),
         "et": ("et", {
             "n_estimators": 2000, "max_depth": None,
@@ -377,7 +453,7 @@ def train_all(trf, tef, fc, tk, ss):
         if nv < 50:
             c = f"n5{tgt}i"
             preds[tgt] = np.clip(Xt[:, fc.index(c)], 0, None) if c in fc else np.zeros(len(Xt))
-            tqdm.write(f"  {tgt}: IDW fallback (n={nv})")
+            tqdm_write(f"  {tgt}: IDW fallback (n={nv})")
             continue
 
         od, td_, sd = {}, {}, {}
@@ -425,13 +501,13 @@ def train_all(trf, tef, fc, tk, ss):
                     fold_pbar.set_postfix(rmse=f"{fold_rmse:.1f}")
 
                 except Exception as e:
-                    tqdm.write(f"    ERROR {mn} fold {fi}: {e}")
+                    tqdm_write(f"    ERROR {mn} fold {fi}: {e}")
 
             fold_pbar.close()
 
             if fs:
                 avg = np.mean(fs)
-                tqdm.write(f"    {mn:10s}: RMSE={avg:.4f} (std={np.std(fs):.4f})")
+                tqdm_write(f"    {mn:10s}: RMSE={avg:.4f} (std={np.std(fs):.4f})")
                 od[mn] = oof; td_[mn] = tp; sd[mn] = avg
 
         model_pbar.close()
@@ -483,12 +559,12 @@ def train_all(trf, tef, fc, tk, ss):
 
                 if fs_s:
                     avg_s = np.mean(fs_s)
-                    tqdm.write(f"    {smn:10s}: RMSE={avg_s:.4f}")
+                    tqdm_write(f"    {smn:10s}: RMSE={avg_s:.4f}")
                     od[smn] = oof_s; td_[smn] = tp_s; sd[smn] = avg_s
 
         # === ENSEMBLE ===
         if len(od) > 1:
-            tqdm.write(f"\n  Ensembling {len(od)} models for {tgt}...")
+            tqdm_write(f"\n  Ensembling {len(od)} models for {tgt}...")
             mns = sorted(od.keys())
             om = np.column_stack([od[m] for m in mns])
             tm = np.column_stack([td_[m] for m in mns])
@@ -525,7 +601,7 @@ def train_all(trf, tef, fc, tk, ss):
                 mr = np.sqrt(mean_squared_error(y[v], mo))
                 if mr < br:
                     br = mr; bp = np.clip(mt_, 0, None)
-                    tqdm.write(f"  -> Ridge stacking wins: {mr:.4f}")
+                    tqdm_write(f"  -> Ridge stacking wins: {mr:.4f}")
             except: pass
 
             if bp is None:
@@ -533,8 +609,8 @@ def train_all(trf, tef, fc, tk, ss):
 
             preds[tgt] = bp; cvs[tgt] = br
             best_single = min(sd, key=sd.get)
-            tqdm.write(f"  ENSEMBLE: {br:.4f} | Best single: {best_single} ({sd[best_single]:.4f})")
-            tqdm.write(f"  Weights: {dict(zip(mns, [f'{w:.3f}' for w in bw]))}")
+            tqdm_write(f"  ENSEMBLE: {br:.4f} | Best single: {best_single} ({sd[best_single]:.4f})")
+            tqdm_write(f"  Weights: {dict(zip(mns, [f'{w:.3f}' for w in bw]))}")
 
         elif len(td_) == 1:
             mn_ = list(td_.keys())[0]
@@ -543,7 +619,7 @@ def train_all(trf, tef, fc, tk, ss):
             preds[tgt] = np.zeros(len(Xt)); cvs[tgt] = 999
 
         elapsed = (datetime.now() - t0).total_seconds()
-        tqdm.write(f"  {tgt} done in {elapsed:.0f}s\n")
+        tqdm_write(f"  {tgt} done in {elapsed:.0f}s\n")
         gc.collect()
 
     target_pbar.close()
@@ -572,7 +648,7 @@ def make_submission(preds, tef, tk, ss):
             b = (sub[c] > 0).sum()
             sub[c] *= mask
             a = (sub[c] > 0).sum()
-            tqdm.write(f"  {t}: {b} -> {a} non-zero")
+            tqdm_write(f"  {t}: {b} -> {a} non-zero")
 
     assert list(sub.columns) == list(ss.columns) and len(sub) == len(ss)
 
@@ -594,8 +670,10 @@ if __name__ == "__main__":
     print(f"  Started: {t0}")
     print(f"{'='*70}")
 
+    xgb_gpu, cb_gpu = detect_gpu()
+
     trf, tef, fc, tk, ss = build_features()
-    preds, cvs, tef, tk, ss = train_all(trf, tef, fc, tk, ss)
+    preds, cvs, tef, tk, ss = train_all(trf, tef, fc, tk, ss, xgb_gpu=xgb_gpu, cb_gpu=cb_gpu)
     sub = make_submission(preds, tef, tk, ss)
 
     print(f"\n{'='*70}")
