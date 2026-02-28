@@ -1,0 +1,26 @@
+column_name,description
+ID,Unique identifier for the soil sampling location or observation.
+Longitude,Longitude coordinate of the sampling location in decimal degrees.
+Latitude,Latitude coordinate of the sampling location in decimal degrees.
+start_date,Start date of the period during which the soil observation or aggregation is valid.
+end_date,End date of the period during which the soil observation or aggregation is valid.
+horizon_lower,Lower depth boundary of the soil horizon in centimetres.
+horizon_upper,Upper depth boundary of the soil horizon in centimetres.
+Depth_cm,Textual representation of the soil depth interval (e.g. '20–50 cm').
+Al,Extractable aluminium concentration in the soil (mg/kg or 1ppm).
+B,Extractable boron concentration in the soil (mg/kg or 1ppm).
+Ca,Extractable calcium concentration in the soil (mg/kg or 1ppm).
+C_organic,Organic carbon by combustion after acidification (mg/kg or 1ppm).
+C_total,Total carbon by combustion (mg/kg or 1ppm).
+Cu,Extractable copper concentration in the soil (mg/kg).
+electrical_conductivity,"Electrical conductivity, saturation extract (dS/m)."
+Fe,Extractable iron concentration in the soil (mg/kg).
+Mg,Extractable magnesium concentration in the soil (mg/kg).
+Mn,Extractable manganese concentration in the soil (mg/kg).
+N,Nitrogen content of the soil.
+ph,"pH, measured in 1:1 soil-water suspension."
+P,Extractable phosphorus concentration in the soil (mg/kg).
+K,Extractable potassium concentration in the soil (mg/kg).
+Na,Extractable sodium concentration in the soil (mg/kg).
+S,Sulphur concentration in the soil (mg/kg).
+Zn,Extractable zinc concentration in the soil (mg/kg).
