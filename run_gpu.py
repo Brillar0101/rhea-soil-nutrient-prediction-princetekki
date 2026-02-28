@@ -328,31 +328,24 @@ def train_all(trf, tef, fc, tk, ss):
             "tree_method": "hist", "device": "cuda",
             "random_state": SEED + 10, "verbosity": 0, "early_stopping_rounds": 300,
         }),
-        # CatBoost GPU (BLAZING FAST on H200)
+        # CatBoost (try GPU, fallback to CPU automatically)
         "cb1": ("cb", {
-            "iterations": 15000, "learning_rate": 0.01, "depth": 10,
+            "iterations": 8000, "learning_rate": 0.02, "depth": 8,
             "l2_leaf_reg": 3, "random_seed": SEED, "verbose": 0,
             "loss_function": "RMSE", "eval_metric": "RMSE",
-            "min_data_in_leaf": 3, "subsample": 0.7,
-            "bootstrap_type": "Bernoulli",
-            "task_type": "GPU", "devices": "0",
+            "min_data_in_leaf": 5,
         }),
         "cb2": ("cb", {
-            "iterations": 12000, "learning_rate": 0.015, "depth": 12,
+            "iterations": 6000, "learning_rate": 0.03, "depth": 6,
             "l2_leaf_reg": 5, "random_seed": SEED + 5, "verbose": 0,
             "loss_function": "RMSE", "eval_metric": "RMSE",
-            "min_data_in_leaf": 5, "subsample": 0.8,
-            "bootstrap_type": "Bernoulli",
-            "random_strength": 1.5, "bagging_temperature": 0.5,
-            "task_type": "GPU", "devices": "0",
+            "min_data_in_leaf": 10,
         }),
         "cb3": ("cb", {
-            "iterations": 10000, "learning_rate": 0.02, "depth": 8,
+            "iterations": 5000, "learning_rate": 0.04, "depth": 10,
             "l2_leaf_reg": 1, "random_seed": SEED + 7, "verbose": 0,
             "loss_function": "RMSE", "eval_metric": "RMSE",
-            "min_data_in_leaf": 10, "subsample": 0.75,
-            "bootstrap_type": "Bernoulli",
-            "task_type": "GPU", "devices": "0",
+            "min_data_in_leaf": 3,
         }),
         # ExtraTrees (CPU, fast enough)
         "et": ("et", {
